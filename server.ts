@@ -755,8 +755,15 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
 
 // room.event fires for all timeline events including m.reaction (which is not
 // surfaced by room.message). Reactions are sent as plaintext even in E2EE rooms.
+import { appendFileSync } from 'fs'
 client.on('room.event', (roomId: string, event: unknown) => {
-  void handleReaction(roomId, event as ReactionEvent)
+  const e = event as ReactionEvent
+  if (e.type === 'm.reaction') {
+    const k = e.content?.['m.relates_to']?.key ?? ''
+    const bytes = Buffer.from(k).toString('hex')
+    try { appendFileSync(join(STATE_DIR, 'event-debug.log'), `${new Date().toISOString()} reaction key=${JSON.stringify(k)} hex=${bytes}\n`) } catch {}
+  }
+  void handleReaction(roomId, e)
 })
 
 client.on('room.decrypted_event', (roomId: string, event: InboundEvent) => {
