@@ -456,6 +456,26 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
     return
   }
 
+  // Standalone emoji shortcut: 👍/✅ = allow, 👎/❌ = deny, resolves the most
+  // recent pending permission. Faster than long-pressing for a reaction in Element.
+  const trimmed = body.trim()
+  const emojiAllow = ['👍', '✅']
+  const emojiDeny = ['👎', '❌']
+  if (pendingPermissions.size > 0 && (emojiAllow.includes(trimmed) || emojiDeny.includes(trimmed))) {
+    const request_id = [...pendingPermissions.keys()].at(-1)!
+    const behavior = emojiAllow.includes(trimmed) ? 'allow' : 'deny'
+    void mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: { request_id, behavior },
+    })
+    pendingPermissions.delete(request_id)
+    for (const [eid, rid] of permissionEventIds) {
+      if (rid === request_id) { permissionEventIds.delete(eid); break }
+    }
+    void sendReaction(ROOM_ID!, eventId, behavior === 'allow' ? '✅' : '❌')
+    return
+  }
+
   void client.setTyping(ROOM_ID!, true, 5000).catch(() => {})
 
   const ts = event.origin_server_ts
@@ -531,7 +551,11 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
 // room.event fires for all timeline events including m.reaction (which is not
 // surfaced by room.message). Reactions are sent as plaintext even in E2EE rooms.
 client.on('room.event', (roomId: string, event: unknown) => {
-  void handleReaction(roomId, event as ReactionEvent)
+  const e = event as ReactionEvent
+  if (e.type === 'm.reaction') {
+    process.stderr.write(`matrix channel: reaction event from ${e.sender} key=${e.content?.['m.relates_to']?.key}\n`)
+  }
+  void handleReaction(roomId, e)
 })
 
 client.on('room.decrypted_event', (roomId: string, event: InboundEvent) => {
