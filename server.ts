@@ -22,8 +22,12 @@ import {
   readFileSync, writeFileSync, mkdirSync,
   renameSync, realpathSync, chmodSync,
 } from 'fs'
+import { exec as execCallback, spawn } from 'child_process'
+import { promisify } from 'util'
 import { homedir } from 'os'
-import { join, sep } from 'path'
+import { join, sep, basename } from 'path'
+
+const execAsync = promisify(execCallback)
 import {
   LogService,
   LogLevel,
@@ -174,6 +178,140 @@ function chunkText(text: string, limit = 16000): string[] {
   }
   if (rest) out.push(rest)
   return out
+}
+
+// --- !commands ---
+
+// Derive tmux session name from working directory basename (matches service ExecStart).
+const TMUX_SOCKET = 'claude-matrix'
+const TMUX_SESSION = `matrix-${basename(process.cwd())}`
+
+const MODEL_ALIASES: Record<string, string> = {
+  opus:    'claude-opus-4-6',
+  sonnet:  'claude-sonnet-4-6',
+  haiku:   'claude-haiku-4-5-20251001',
+  // shorter convenience aliases
+  'opus4':    'claude-opus-4-6',
+  'sonnet4':  'claude-sonnet-4-6',
+  'haiku4':   'claude-haiku-4-5-20251001',
+}
+
+function stripAnsi(s: string): string {
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '')
+}
+
+async function tmuxSend(keys: string): Promise<void> {
+  await execAsync(`tmux -L ${TMUX_SOCKET} send-keys -t ${TMUX_SESSION} ${JSON.stringify(keys)} Enter`)
+}
+
+async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
+  switch (cmd) {
+    case 'help': {
+      const lines = [
+        '**!commands**',
+        '',
+        '`!help` — this list',
+        '`!status` — bridge + systemd status',
+        '`!context` — context window usage for current session',
+        '`!context all` — usage across all sessions',
+        '`!clear` — clear Claude\'s context (fresh start)',
+        '`!compact` — compact context (summarise + continue)',
+        '`!model <name>` — switch model',
+        '  aliases: `opus`, `sonnet`, `haiku` (or full model ID)',
+        '`!restart` — restart the bridge service',
+      ]
+      await sendText(ROOM_ID!, lines.join('\n'))
+      return true
+    }
+
+    case 'status': {
+      try {
+        const { stdout } = await execAsync(
+          'systemctl --user show claude-matrix.service --property=ActiveState,SubState,MainPID,ExecMainStartTimestamp --no-pager',
+        )
+        const lines = Object.fromEntries(
+          stdout.trim().split('\n').map(l => l.split('=') as [string, string]),
+        )
+        const upSince = lines['ExecMainStartTimestamp'] ?? 'unknown'
+        const state = `${lines['ActiveState'] ?? '?'}/${lines['SubState'] ?? '?'}`
+        const pid = lines['MainPID'] ?? '?'
+        await sendText(ROOM_ID!, [
+          `**Bridge status**`,
+          `State: ${state}`,
+          `PID: ${pid}`,
+          `Up since: ${upSince}`,
+          `Session: tmux -L ${TMUX_SOCKET} attach -t ${TMUX_SESSION}`,
+        ].join('\n'))
+      } catch (err) {
+        await sendText(ROOM_ID!, `status failed: ${err}`)
+      }
+      return true
+    }
+
+    case 'context': {
+      const flag = args === 'all' ? '--all' : ''
+      try {
+        const { stdout } = await execAsync(
+          `/home/colton/.local/bin/check-context.sh ${flag}`,
+          { cwd: process.cwd() },
+        )
+        const clean = stripAnsi(stdout).trim()
+        await sendText(ROOM_ID!, clean.length ? `\`\`\`\n${clean}\n\`\`\`` : 'No context data found.')
+      } catch (err) {
+        await sendText(ROOM_ID!, `context check failed: ${err}`)
+      }
+      return true
+    }
+
+    case 'clear': {
+      try {
+        await tmuxSend('/clear')
+        await sendText(ROOM_ID!, '✓ Context cleared — new conversation started.')
+      } catch (err) {
+        await sendText(ROOM_ID!, `clear failed: ${err}`)
+      }
+      return true
+    }
+
+    case 'compact': {
+      try {
+        await tmuxSend('/compact')
+        await sendText(ROOM_ID!, '↺ Compacting context…')
+      } catch (err) {
+        await sendText(ROOM_ID!, `compact failed: ${err}`)
+      }
+      return true
+    }
+
+    case 'model': {
+      if (!args) {
+        await sendText(ROOM_ID!, 'Usage: `!model <name>`\nAliases: opus, sonnet, haiku (or full model ID)')
+        return true
+      }
+      const modelId = MODEL_ALIASES[args.toLowerCase()] ?? args
+      try {
+        await tmuxSend(`/model ${modelId}`)
+        await sendText(ROOM_ID!, `✓ Switching to \`${modelId}\``)
+      } catch (err) {
+        await sendText(ROOM_ID!, `model switch failed: ${err}`)
+      }
+      return true
+    }
+
+    case 'restart': {
+      await sendText(ROOM_ID!, '↺ Restarting bridge…')
+      spawn('systemctl', ['--user', 'restart', 'claude-matrix.service'], {
+        detached: true,
+        stdio: 'ignore',
+        env: { ...process.env },
+      }).unref()
+      return true
+    }
+
+    default:
+      return false
+  }
 }
 
 // --- Matrix client setup ---
@@ -429,6 +567,14 @@ async function handleMessage(roomId: string, event: InboundEvent): Promise<void>
 
   if (!isAllowed(event.sender ?? '')) {
     process.stderr.write(`matrix channel: dropped message from unlisted user ${event.sender}\n`)
+    return
+  }
+
+  // !command intercept — handled in the plugin, never forwarded to Claude
+  const bangMatch = /^!(\w+)(?:\s+([\s\S]*))?$/.exec(body.trim())
+  if (bangMatch) {
+    const handled = await handleBangCommand(bangMatch[1]!.toLowerCase(), (bangMatch[2] ?? '').trim())
+    if (!handled) await sendText(ROOM_ID!, `Unknown command: \`!${bangMatch[1]}\`. Try \`!help\`.`)
     return
   }
 
