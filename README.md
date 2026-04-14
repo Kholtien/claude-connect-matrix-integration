@@ -2,7 +2,7 @@
 
 A Matrix channel plugin for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) that wires an end-to-end encrypted Matrix room into a running Claude Code session. Send a message from any Matrix client (Element, FluffyChat, Cinny), Claude sees it, Claude replies back into the encrypted room.
 
-Works wherever Claude Code runs: headless servers, WSL, SSH sessions, plain terminals. No desktop app, no third-party messaging service sitting in the middle.
+Works wherever Claude Code runs: headless servers, WSL, SSH sessions, plain terminals. No desktop app, no third party messaging service sitting in the middle.
 
 This is a fork of [metalchef1/Claude-Connect-Matrix-Integration](https://github.com/metalchef1/Claude-Connect-Matrix-Integration) with the Matrix I/O layer rewritten on top of [`matrix-bot-sdk`](https://github.com/turt2live/matrix-bot-sdk) so the bot can actually join encrypted rooms. The crypto self-signing routine is lifted from [Kholtien/nanoclaw](https://github.com/Kholtien/nanoclaw).
 
@@ -136,6 +136,56 @@ The `/matrix:access` skill will refuse to process access-list changes that come 
 
 ---
 
+## Approving tool permissions from Matrix
+
+When Claude wants to run a tool (Bash, Write, Edit, etc.), it sends a permission request to the room:
+
+```
+🔐 Permission: Bash
+Run a shell command.
+
+`{"command":"ls -la"}`
+
+React 👍 to allow or 👎 to deny. (Or reply yes abcde / no abcde)
+```
+
+React with 👍 or ✅ to allow, 👎 or ❌ to deny. If your client doesn't support reactions, reply with `yes abcde` / `no abcde` using the ID in the message.
+
+---
+
+## !commands
+
+The plugin intercepts messages starting with `!` before they reach Claude — zero tokens, instant response.
+
+| Command | What it does |
+|---|---|
+| `!help` | List all commands |
+| `!status` | Service state and uptime |
+| `!context` | Context window usage for the current session |
+| `!context all` | Usage across all sessions |
+| `!clear` | Clear Claude's context and start fresh |
+| `!compact` | Compact the context (summarise and continue) |
+| `!model <name>` | Switch model — aliases: `opus`, `sonnet`, `haiku`, or a full model ID |
+| `!restart` | Restart the bridge service |
+
+---
+
+## Multiple-choice questions
+
+Claude Code's interactive question UI is terminal-only and can't reach Matrix. Instead, Claude formats choices as a numbered list and you react with the corresponding number:
+
+```
+❓ Which approach would you prefer?
+
+1️⃣  Keep it simple, ship now
+2️⃣  Add tests first
+3️⃣  Refactor the whole thing
+```
+
+React with 1️⃣, 2️⃣, etc. to select. The bot reacts back with ✓ to confirm it registered, then continues. You can also just type the number as a message if reactions feel awkward.
+
+---
+
 ## Security notes
 
 ### Threat model
@@ -145,7 +195,7 @@ This plugin assumes you're pointing it at a homeserver you control. The bot's pa
 ### Allowlist + permission relay
 
 - Inbound Matrix messages are dropped unless the sender is on the allowlist (`access.json`).
-- The `yes <id>` / `no <id>` permission-reply intercept only honours replies for permission requests the plugin actually relayed. Trying to forge a grant ID preemptively gets rejected with a ❓ reaction.
+- Permission grant reactions are only honoured for requests the plugin actually relayed. Forging a grant ID preemptively gets rejected with a ❓ reaction.
 - Auto-join is restricted to the configured `MATRIX_ROOM_ID`. Invites to any other room are ignored.
 
 ### Known dependency advisories
