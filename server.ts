@@ -552,9 +552,7 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
 // surfaced by room.message). Reactions are sent as plaintext even in E2EE rooms.
 client.on('room.event', (roomId: string, event: unknown) => {
   const e = event as ReactionEvent
-  if (e.type === 'm.reaction') {
-    process.stderr.write(`matrix channel: reaction event from ${e.sender} key=${e.content?.['m.relates_to']?.key}\n`)
-  }
+  process.stderr.write(`matrix channel: room.event type=${e.type} from=${e.sender}\n`)
   void handleReaction(roomId, e)
 })
 
