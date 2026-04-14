@@ -725,13 +725,20 @@ async function handleReaction(roomId: string, event: ReactionEvent): Promise<voi
 
   // Number emoji reactions on bot messages → forward to Claude as a selection.
   // This is how multiple-choice Q&A works over Matrix (AskUserQuestion is TUI-only).
-  const NUMBER_EMOJIS = new Set(['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣'])
-  if (NUMBER_EMOJIS.has(normalizedKey) && botSentEventIds.has(targetEventId)) {
+  // Normalize both sides — keycap emoji are digit + U+FE0F + U+20E3, so stripping
+  // variation selectors from both the incoming key and the set entries is required.
+  const NUMBER_EMOJI_MAP: Record<string, string> = {
+    '1\u20E3': '1️⃣', '2\u20E3': '2️⃣', '3\u20E3': '3️⃣',
+    '4\u20E3': '4️⃣', '5\u20E3': '5️⃣', '6\u20E3': '6️⃣',
+    '7\u20E3': '7️⃣', '8\u20E3': '8️⃣', '9\u20E3': '9️⃣',
+  }
+  const canonicalNumber = NUMBER_EMOJI_MAP[normalizedKey]
+  if (canonicalNumber && botSentEventIds.has(targetEventId)) {
     const ts = new Date().toISOString()
     void mcp.notification({
       method: 'notifications/claude/channel',
       params: {
-        content: normalizedKey,
+        content: canonicalNumber,
         meta: {
           room_id: ROOM_ID,
           event_id: event.event_id ?? '',
