@@ -19,7 +19,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { z } from 'zod'
 import {
-  readFileSync, writeFileSync, mkdirSync,
+  readFileSync, writeFileSync, mkdirSync, unlinkSync,
   renameSync, realpathSync, chmodSync, statSync,
 } from 'fs'
 import { exec as execCallback, spawn } from 'child_process'
@@ -64,6 +64,7 @@ import { relogWithPinnedDevice, autoSignDevice } from './crypto.js'
 const STATE_DIR = process.env.MATRIX_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'matrix-e2ee')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
+const PROVIDER_FILE = join(STATE_DIR, 'provider')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
@@ -193,22 +194,36 @@ function chunkText(text: string, limit = 16000): string[] {
 // --- !commands ---
 
 // Derive tmux session name from working directory basename (matches service ExecStart).
-const TMUX_SOCKET = 'claude-matrix'
+const TMUX_SOCKET = process.env.TMUX_SOCKET ?? 'claude-matrix'
 const TMUX_SESSION = `matrix-${basename(process.cwd())}`
+const SERVICE_NAME = TMUX_SOCKET === 'claude-matrix-dev'
+  ? 'claude-matrix-dev.service'
+  : 'claude-matrix.service'
 
-const MODEL_ALIASES: Record<string, string> = {
-  opus:    'claude-opus-4-6',
-  sonnet:  'claude-sonnet-4-6',
-  haiku:   'claude-haiku-4-5-20251001',
-  // shorter convenience aliases
-  'opus4':    'claude-opus-4-6',
-  'sonnet4':  'claude-sonnet-4-6',
-  'haiku4':   'claude-haiku-4-5-20251001',
+const MODEL_ALIASES: Record<string, Record<string, string>> = {
+  anthropic: {
+    opus:    'claude-opus-4-6',
+    sonnet:  'claude-sonnet-4-6',
+    haiku:   'claude-haiku-4-5-20251001',
+    opus4:   'claude-opus-4-6',
+    sonnet4: 'claude-sonnet-4-6',
+    haiku4:  'claude-haiku-4-5-20251001',
+  },
+  zai: {
+    opus:   'glm-5.1',
+    sonnet: 'glm-5-turbo',
+    haiku:  'glm-4.7',
+  },
 }
 
 function stripAnsi(s: string): string {
   // eslint-disable-next-line no-control-regex
   return s.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '')
+}
+
+function readProvider(): string {
+  try { return readFileSync(PROVIDER_FILE, 'utf8').trim() }
+  catch { return 'anthropic' }
 }
 
 async function tmuxSend(keys: string): Promise<void> {
@@ -309,6 +324,95 @@ function formatUsageReply(data: UsageData): string {
   return lines.join('\n')
 }
 
+// --- !zusage helpers ---
+
+interface ZaiLimit {
+  type: string
+  unit: number
+  number: number
+  usage?: number
+  currentValue?: number
+  remaining?: number
+  percentage?: number
+  nextResetTime?: number
+  usageDetails?: { modelCode: string; usage: number }[]
+}
+
+interface ZaiUsageData {
+  limits: ZaiLimit[]
+  level: string
+}
+
+async function fetchZaiUsageData(): Promise<ZaiUsageData | null> {
+  const cacheFile = '/tmp/claude/statusline-zai-usage-cache.json'
+  const cacheMaxAge = 60 // seconds
+
+  try {
+    const stat = statSync(cacheFile)
+    const ageSeconds = (Date.now() - stat.mtimeMs) / 1000
+    if (ageSeconds < cacheMaxAge) {
+      return JSON.parse(readFileSync(cacheFile, 'utf8')) as ZaiUsageData
+    }
+  } catch {}
+
+  const apiKey = process.env.ZAI_API_KEY
+  if (!apiKey) return null
+
+  try {
+    const res = await fetch('https://api.z.ai/api/monitor/usage/quota/limit', {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(5000),
+    })
+    if (!res.ok) return null
+    const body = await res.json() as { data: ZaiUsageData }
+    const data = body.data
+    try {
+      mkdirSync('/tmp/claude', { recursive: true })
+      writeFileSync(cacheFile, JSON.stringify(data))
+    } catch {}
+    return data
+  } catch {
+    return null
+  }
+}
+
+function formatZaiUsageReply(data: ZaiUsageData): string {
+  const lines: string[] = [`**📊 Z.ai Usage** (${data.level})`, '']
+
+  // TIME_LIMIT = monthly web tool quota (search-prime, web-reader, zread)
+  // TOKENS_LIMIT = 5-hour token quota
+  const timeLimit = data.limits.find(l => l.type === 'TIME_LIMIT')
+  const tokenLimit = data.limits.find(l => l.type === 'TOKENS_LIMIT')
+
+  if (tokenLimit) {
+    const pct = Math.round(tokenLimit.percentage ?? 0)
+    const reset = tokenLimit.nextResetTime
+      ? formatResetTime(new Date(tokenLimit.nextResetTime).toISOString(), 'time')
+      : ''
+    lines.push(`- **5h tokens:** ${pct}%${reset ? ` — resets ${reset}` : ''}`)
+  }
+
+  if (timeLimit) {
+    const pct = Math.round(timeLimit.percentage ?? 0)
+    const exhausted = (timeLimit.remaining ?? 1) === 0 ? ' ⚠ exhausted' : ''
+    const reset = timeLimit.nextResetTime
+      ? formatResetTime(new Date(timeLimit.nextResetTime).toISOString(), 'datetime')
+      : ''
+    lines.push(`- **Monthly web tools:** ${pct}%${exhausted}${reset ? ` — resets ${reset}` : ''}`)
+    if (timeLimit.usageDetails?.length) {
+      const detail = timeLimit.usageDetails
+        .map(u => `${u.modelCode}: ${u.usage}`)
+        .join('  •  ')
+      lines.push(`  ${detail}`)
+    }
+  }
+
+  return lines.join('\n')
+}
+
 async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
   switch (cmd) {
     case 'help': {
@@ -322,8 +426,10 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
         '- `!clear` — clear Claude\'s context (fresh start)',
         '- `!compact` — compact context (summarise + continue)',
         '- `!model <name>` — switch model (aliases: `opus`, `sonnet`, `haiku`)',
+        '- `!zai` — switch to z.ai provider (restarts bridge)',
+        '- `!anthropic` — switch to Anthropic provider (restarts bridge)',
         '- `!restart` — restart the bridge service',
-        '- `!usage` — Anthropic plan usage (5h, 7d, extra)',
+        '- `!usage` — provider usage (Anthropic or z.ai, based on active provider)',
       ]
       await sendText(ROOM_ID!, lines.join('\n'))
       return true
@@ -332,7 +438,7 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
     case 'status': {
       try {
         const { stdout } = await execAsync(
-          'systemctl --user show claude-matrix.service --property=ActiveState,SubState,MainPID,ExecMainStartTimestamp --no-pager',
+          `systemctl --user show ${SERVICE_NAME} --property=ActiveState,SubState,MainPID,ExecMainStartTimestamp --no-pager`,
         )
         const lines = Object.fromEntries(
           stdout.trim().split('\n').map(l => l.split('=') as [string, string]),
@@ -340,11 +446,13 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
         const upSince = lines['ExecMainStartTimestamp'] ?? 'unknown'
         const state = `${lines['ActiveState'] ?? '?'}/${lines['SubState'] ?? '?'}`
         const pid = lines['MainPID'] ?? '?'
+        const provider = readProvider()
         await sendText(ROOM_ID!, [
           `**Bridge status**`,
           `State: ${state}`,
           `PID: ${pid}`,
           `Up since: ${upSince}`,
+          `Provider: ${provider}`,
           `Session: \`tmux -L ${TMUX_SOCKET} attach -t ${TMUX_SESSION}\``,
         ].join('  \n'))
       } catch (err) {
@@ -400,19 +508,51 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
         await sendText(ROOM_ID!, 'Usage: `!model <name>`  \nAliases: `opus`, `sonnet`, `haiku` (or full model ID)')
         return true
       }
-      const modelId = MODEL_ALIASES[args.toLowerCase()] ?? args
+      const provider = readProvider()
+      const modelAliases = MODEL_ALIASES[provider] ?? MODEL_ALIASES.anthropic
+      const modelId = modelAliases[args.toLowerCase()] ?? args
       try {
         await tmuxSend(`/model ${modelId}`)
-        await sendText(ROOM_ID!, `✓ Switching to \`${modelId}\``)
+        await sendText(ROOM_ID!, `✓ Switching to \`${modelId}\` (provider: ${provider})`)
       } catch (err) {
         await sendText(ROOM_ID!, `model switch failed: ${err}`)
       }
       return true
     }
 
+    case 'zai': {
+      try {
+        writeFileSync(PROVIDER_FILE, 'zai', { mode: 0o600 })
+        await sendText(ROOM_ID!, '↺ Switching provider to **z.ai** — restarting bridge…')
+        spawn('systemctl', ['--user', 'restart', SERVICE_NAME], {
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env },
+        }).unref()
+      } catch (err) {
+        await sendText(ROOM_ID!, `zai switch failed: ${err}`)
+      }
+      return true
+    }
+
+    case 'anthropic': {
+      try {
+        try { unlinkSync(PROVIDER_FILE) } catch {}
+        await sendText(ROOM_ID!, '↺ Switching provider to **Anthropic** — restarting bridge…')
+        spawn('systemctl', ['--user', 'restart', SERVICE_NAME], {
+          detached: true,
+          stdio: 'ignore',
+          env: { ...process.env },
+        }).unref()
+      } catch (err) {
+        await sendText(ROOM_ID!, `anthropic switch failed: ${err}`)
+      }
+      return true
+    }
+
     case 'restart': {
       await sendText(ROOM_ID!, '↺ Restarting bridge…')
-      spawn('systemctl', ['--user', 'restart', 'claude-matrix.service'], {
+      spawn('systemctl', ['--user', 'restart', SERVICE_NAME], {
         detached: true,
         stdio: 'ignore',
         env: { ...process.env },
@@ -422,12 +562,22 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
 
     case 'usage': {
       try {
-        const usageData = await fetchUsageData()
-        if (!usageData) {
-          await sendText(ROOM_ID!, 'Could not fetch usage data — credentials missing or API unreachable.')
-          return true
+        const provider = readProvider()
+        if (provider === 'zai') {
+          const usageData = await fetchZaiUsageData()
+          if (!usageData) {
+            await sendText(ROOM_ID!, 'Could not fetch z.ai usage — API key missing or unreachable.')
+            return true
+          }
+          await sendText(ROOM_ID!, formatZaiUsageReply(usageData))
+        } else {
+          const usageData = await fetchUsageData()
+          if (!usageData) {
+            await sendText(ROOM_ID!, 'Could not fetch usage data — credentials missing or API unreachable.')
+            return true
+          }
+          await sendText(ROOM_ID!, formatUsageReply(usageData))
         }
-        await sendText(ROOM_ID!, formatUsageReply(usageData))
       } catch (err) {
         await sendText(ROOM_ID!, `usage failed: ${err}`)
       }
