@@ -311,16 +311,15 @@ async function handleBangCommand(cmd: string, args: string): Promise<boolean> {
       const lines = [
         '**!commands**',
         '',
-        '`!help` — this list',
-        '`!status` — bridge + systemd status',
-        '`!context` — context window usage for current session',
-        '`!context all` — usage across all sessions',
-        '`!clear` — clear Claude\'s context (fresh start)',
-        '`!compact` — compact context (summarise + continue)',
-        '`!model <name>` — switch model',
-        '  aliases: `opus`, `sonnet`, `haiku` (or full model ID)',
-        '`!restart` — restart the bridge service',
-        '`!usage` — Anthropic plan usage (5h, 7d, extra)',
+        '- `!help` — this list',
+        '- `!status` — bridge + systemd status',
+        '- `!context` — context window usage for current session',
+        '- `!context all` — usage across all sessions',
+        '- `!clear` — clear Claude\'s context (fresh start)',
+        '- `!compact` — compact context (summarise + continue)',
+        '- `!model <name>` — switch model (aliases: `opus`, `sonnet`, `haiku`)',
+        '- `!restart` — restart the bridge service',
+        '- `!usage` — Anthropic plan usage (5h, 7d, extra)',
       ]
       await sendText(ROOM_ID!, lines.join('\n'))
       return true
